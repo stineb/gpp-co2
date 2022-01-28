@@ -1,0 +1,162 @@
+---
+title: "Sink normalization"
+author: "Beni Stocker"
+date: "1/28/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(knitr)
+```
+
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+df <- read_csv("data/T_Sland.csv", col_types = "ddddddddddddddd") %>% 
+    pivot_longer(1:15, names_to = "source", values_to = "sland") %>% 
+    left_join(
+        read_csv("data/T_betaGPP.csv") %>% 
+            pivot_longer(1:14, names_to = "source", values_to = "beta_gpp"),
+        by = "source"
+    ) %>% 
+    left_join(
+        read_csv("data/T_betaReco.csv") %>% 
+            pivot_longer(1:13, names_to = "source", values_to = "beta_reco"),
+        by = "source"
+    ) %>% 
+    left_join(
+        read_csv("data/T_nonRespFlux.csv", col_types = "dddddddddddddd") %>% 
+            pivot_longer(1:14, names_to = "source", values_to = "nrf"),
+        by = "source"
+    )
+```
+
+When reading the files you sent me, some data is missing.
+```{r echo=FALSE}
+knitr::kable(df)
+```
+
+Olot original Beta-GPP vs the sink. Note that this displays the 95% confidence interval to be somewhat larger than in ED Fig. 1.
+```{r , warning=FALSE, message=FALSE}
+df %>% 
+    ggplot(aes(sland, beta_gpp)) +
+    geom_point() +
+    geom_smooth(method = "lm", color = "red", level = 0.95) +
+    theme_classic()
+```
+
+Fit a linear regression model. Note that the R-squared is 0.95, not 0.99 as in the paper.
+```{r}
+linmod <- lm(sland ~ beta_gpp + beta_reco * nrf,
+             data = df %>% 
+                 filter(source != "GCPresidualSink")
+             )
+summary(linmod)
+```
+
+Apply variance normalization on the sink 
+```{r}
+cf <- coef(linmod)
+
+df <- df %>% 
+    mutate(betareco_nrf = beta_reco * nrf) %>% 
+    mutate(b_beta_reco = cf["beta_reco"] * beta_reco,
+           c_betareco_nrf = cf["beta_reco:nrf"] * betareco_nrf )
+
+b_beta_reco_mean <- mean(df$b_beta_reco, na.rm = TRUE)
+c_betareco_nrf_mean <- mean(df$c_betareco_nrf, na.rm = TRUE)
+
+df <- df %>% 
+    mutate(sland_norm = sland - ((b_beta_reco + c_betareco_nrf) - (b_beta_reco_mean + c_betareco_nrf_mean)))
+```
+
+Plot normalised sink vs beta-gpp. Doesn't look the way it should...
+```{r, warning=FALSE, message=FALSE}
+df %>% 
+    ggplot(aes(sland_norm, beta_gpp)) +
+    geom_point() +
+    geom_smooth(method = "lm", color = "red", level = 0.95) +
+    theme_classic()
+```
+
+Should it also be normalised for the non-respired flux (nrf)?
+```{r}
+cf <- coef(linmod)
+
+df <- df %>% 
+    mutate(d_nrf = cf["nrf"] * nrf )
+
+d_nrf_mean <- mean(df$d_nrf, na.rm = TRUE)
+
+df <- df %>% 
+    mutate(sland_norm2 = sland - ((b_beta_reco + c_betareco_nrf + d_nrf) - (b_beta_reco_mean + c_betareco_nrf_mean + d_nrf_mean)))
+```
+
+Yes!
+```{r, warning=FALSE, message=FALSE}
+df %>% 
+    ggplot(aes(sland_norm2, beta_gpp)) +
+    geom_point() +
+    geom_smooth(method = "lm", color = "red", level = 0.95) +
+    theme_classic()
+```
+
+That's the one that gets the R-squared of 0.99:
+```{r}
+yardstick::rsq(df, sland_norm2, beta_gpp) %>% pull(.estimate)
+```
+
+Are the means of the original and normalised (red) sinks different? No!!!
+```{r}
+df %>% 
+  ggplot() +
+  geom_density(aes(sland_norm, ..density..)) +
+  geom_density(aes(sland_norm2, ..density..), color = "red") +
+  geom_vline(xintercept = mean(df$sland_norm, na.rm = TRUE), size = 2) +
+  geom_vline(xintercept = mean(df$sland_norm2, na.rm = TRUE), color = "red") +
+  theme_classic()
+```
+
+
+Now, perturb the distribution by removing a model (the first one: CABLE).
+Let's make this a function.
+```{r}
+normalize_sink <- function(df){
+  linmod <- lm(sland ~ beta_gpp + beta_reco * nrf,
+             data = df %>% 
+                 filter(source != "GCPresidualSink") %>% 
+                 slice(-1)
+             )
+  cf <- coef(linmod)
+  out <- df %>% 
+      mutate(betareco_nrf = beta_reco * nrf) %>% 
+      mutate(b_beta_reco = cf["beta_reco"] * beta_reco,
+             c_betareco_nrf = cf["beta_reco:nrf"] * betareco_nrf,
+             d_nrf = cf["nrf"] * nrf)
+  
+  b_beta_reco_mean <- mean(out$b_beta_reco, na.rm = TRUE)
+  c_betareco_nrf_mean <- mean(out$c_betareco_nrf, na.rm = TRUE)
+  d_nrf_mean <- mean(out$d_nrf, na.rm = TRUE)
+
+  out <- out %>% 
+    mutate(sland_norm2 = sland - ((b_beta_reco + c_betareco_nrf + d_nrf) - (b_beta_reco_mean + c_betareco_nrf_mean + d_nrf_mean)))
+  
+  return(out)
+}
+
+df2 <- df %>% 
+  slice(-1) %>% 
+  normalize_sink()
+```
+
+
+Plot both distributions and means: it does affect the mean (vertical lines).
+```{r}
+ggplot() +
+  geom_density(aes(sland_norm2, ..density..), data = df) +
+  geom_density(aes(sland_norm2, ..density..), data = df2, color = "red") +
+  geom_vline(xintercept = mean(df$sland_norm2, na.rm = TRUE), lintetype = "dashed") +
+  geom_vline(xintercept = mean(df2$sland_norm2, na.rm = TRUE), color = "red", lintetype = "dashed") +
+  theme_classic()
+```
+
